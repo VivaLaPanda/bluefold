@@ -3,10 +3,7 @@ const { BskyAgent } = bsky;
 const { RichText } = bsky;
 import * as dotenv from 'dotenv';
 import process from 'node:process';
-import fs from 'node:fs';
-dotenv.config({
-  override: true,
-});
+dotenv.config();
 
 import { Manifold } from 'manifold-sdk';
 import { Configuration, OpenAIApi } from 'openai';
@@ -17,10 +14,6 @@ const openai = new OpenAIApi(configuration);
 
 const agent = new BskyAgent({
   service: 'https://bsky.social',
-  persistSession: (evt, sess) => {
-    // store the session-data for reuse in a json file
-    fs.writeFileSync('session.json', JSON.stringify(sess));
-  }
 });
 
 const manifold = new Manifold(process.env.MANIFOLD_API_KEY);
@@ -127,7 +120,7 @@ async function createPredictionMarket(post) {
 // development function to test manifold market creation
 async function testManifold() {
   const market = await manifold.createMarket({
-    description: "Prediction market for the post https://bsky.app/profile/mfoldbot.bsky.social/post/3jtvtu5yvds2v",
+    descriptionMarkdown: "Prediction market for [the post](https://bsky.app/profile/mfoldbot.bsky.social/post/3jtvtu5yvds2v)",
     outcomeType: "BINARY",
     question: "Will real 75th percentile software engineer comp be higher than today in 2025 in The Bay Area",
     closeTime: 1767225600000,
@@ -149,7 +142,7 @@ async function replyWithMarketLink(post, notif) {
   })
 
   // Use richtext to create a post that links to the market
-  const rt = new RichText({text: `You can find the prediction market for this post at ${fullMarket.url}`});
+  const rt = new RichText({text: `${fullMarket.question}: Bet on it at ${fullMarket.url}`});
   await rt.detectFacets(agent);
 
   // Post the reply
@@ -211,11 +204,20 @@ async function listenForMentions() {
       console.log('notif', notif)
 
       const record = notif.record as any
+      
+      // if record.reply has no parent, skip it
+      if (!record?.reply?.parent) {
+        console.log('skipping')
+        return
+      }
       await handleMention(record.reply, notif)
     })
 
     // Only update notifs after we've successfully handled them
     agent.updateSeenNotifications()
+
+    // Wait 5 seconds before checking again
+    await new Promise((resolve) => setTimeout(resolve, 5000));
   }
 }
 
@@ -232,10 +234,6 @@ async function main() {
     throw new Error('BSKY_USERNAME and BSKY_PASSWORD must be set in the environment');
   }
   await agent.login({ identifier: process.env.BSKY_USERNAME, password: process.env.BSKY_PASSWORD });
-
-  // get the sessions data from the json file
-  const sessionData = fs.readFileSync('session.json', 'utf8');
-  await agent.resumeSession(JSON.parse(sessionData));
 
   // await testCallGpt4();
   await listenForMentions();

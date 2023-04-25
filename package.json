@@ -1,10 +1,11 @@
 {
-  "name": "bluesky-starter-kit",
+  "name": "bluefold",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "ts-node-esm index.ts"
+    "start": "ts-node-esm index.ts",
+    "build": "tsc"
   },
   "keywords": [],
   "author": "",

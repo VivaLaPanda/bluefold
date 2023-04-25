@@ -1,0 +1,10 @@
+# fly.toml app configuration file generated for bluefold on 2023-04-25T16:01:09-07:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = "bluefold"
+primary_region = "sjc"
+
+[env]
+  BSKY_USERNAME = "manifold.vivalapanda.moe"
