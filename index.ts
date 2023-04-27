@@ -53,7 +53,7 @@ async function createPredictionMarket(post) {
   // Convert the post into a question phrased like a prediction market
   const prompt = `Convert a post into a suitably structured question for a prediction market,
   including resolution criteria, timeline.
-  As useful context when setting the market resolution dates, the current date/time is ${date}.
+  As useful context when setting the market resolution dates, the current date/time is ${date} (in UTC).
   If you reference a user in the market title, preface their handle with an @ symbol.
 
   Example:
@@ -82,7 +82,7 @@ async function createPredictionMarket(post) {
 
   // Create the JSON from the question
   const jsonPrompt = `Create a manifold.markets prediction market JSON from a question. Do not use trailing commas. Begin your output with
-    [BEGIN OUTPUT] and end it with [END OUTPUT]. Use the YYYY-DD-DDTHH:MM:SS.000Z timestamp for the closeTime.
+    [BEGIN OUTPUT] and end it with [END OUTPUT]. Use the YYYY-DD-DDTHH:MM:SS.000Z timestamp format for the closeTime (use UTC).
 
     Example:
     Input: "Will real 75th percentile software engineer comp be higher than today in 2025 in The Bay Area"
@@ -110,7 +110,14 @@ async function createPredictionMarket(post) {
   const marketJSON = JSON.parse(json);
 
   // Replace the 2025-01-01T00:00:00.000Z timestamp with a unix timestamp
-  marketJSON.closeTime = new Date(marketJSON.closeTime).getTime();
+  marketJSON.closeTime = new Date(Date.UTC(
+    marketJSON.closeTime.getFullYear(),
+    marketJSON.closeTime.getMonth(),
+    marketJSON.closeTime.getDate(),
+    marketJSON.closeTime.getHours(),
+    marketJSON.closeTime.getMinutes(),
+    marketJSON.closeTime.getSeconds()
+  )).getTime();
 
   const market = await manifold.createMarket(marketJSON);
 
@@ -210,14 +217,21 @@ async function listenForMentions() {
         console.log('skipping')
         return
       }
+
+      // if record.text doesn't include our handle, skip it
+      if (!record.text.includes(process.env.BSKY_USERNAME)) {
+        console.log('skipping')
+        return
+      }
+
       await handleMention(record.reply, notif)
     })
 
     // Only update notifs after we've successfully handled them
     agent.updateSeenNotifications()
 
-    // Wait 5 seconds before checking again
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    // Wait 30 seconds before checking again
+    await new Promise((resolve) => setTimeout(resolve, 30000));
   }
 }
 
