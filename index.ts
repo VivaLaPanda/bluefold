@@ -1,4 +1,4 @@
-import bsky, { AppBskyNotificationListNotifications } from '@atproto/api';
+import bsky, { AppBskyNotificationListNotifications, LikeRecord, PostRecord } from '@atproto/api';
 const { BskyAgent } = bsky;
 const { RichText } = bsky;
 import { backOff } from "exponential-backoff";
@@ -6,7 +6,7 @@ import * as dotenv from 'dotenv';
 import process from 'node:process';
 dotenv.config();
 
-import { Manifold } from 'manifold-sdk';
+import { FullMarket, Manifold } from 'manifold-sdk';
 import { Configuration, OpenAIApi } from 'openai';
 const configuration = new Configuration({
   apiKey: process.env.OPENAI_API_KEY,
@@ -46,7 +46,48 @@ async function callGPT4(prompt: string) {
   }
 }
 
-async function createPredictionMarket(post: any, resolver: string) {
+type Post = {
+  uri: string;
+  cid: string;
+  author: {
+    did: string;
+    handle: string;
+    displayName: string;
+    description: string;
+    avatar: string;
+    indexedAt: string;
+    viewer: {
+      muted: boolean;
+      followedBy: string;
+    };
+    labels: string[];
+  };
+  record: Record;
+  replyCount: number;
+  repostCount: number;
+  likeCount: number;
+  labels: string[];
+};
+
+type Reply = {
+  root: {
+    uri: string;
+    cid: string;
+  };
+  parent: {
+    uri: string;
+    cid: string;
+  };
+}
+
+type Record = {
+  text: string;
+  reply: Reply;
+  facets: any[];
+  createdAt: string;
+};
+
+async function createPredictionMarket(post: Post, resolver: string) {
   const post_text = post.record.text
   const date = post.record.createdAt
 
@@ -58,6 +99,7 @@ async function createPredictionMarket(post: any, resolver: string) {
   As useful context when setting the market resolution dates, the current date/time is ${date} (in UTC).
   If you reference a user in the market title, preface their handle with an @ symbol.
   The response should be at most 120 characters.
+  Responses should always be in the form of a YES/NO question.
 
   Example:
   Post: "I caught the very tail end of the hedge fund boom when it was clear that employee compensation on Wall Street was going to be structurally lower going forward than it was before the mid-2000's, and it's the same exact dynamic in Silicon Valley today."
@@ -78,6 +120,10 @@ async function createPredictionMarket(post: any, resolver: string) {
   Author: testing.bsky.social
   Response: "Will @testing.bsky.social have a bot built by April 21st, 2023?"
 
+  Post: "prediction market: when will i see a stranger using bluesky on public transit for the first time"
+  Author: emily.bsky.team
+  Response: "Will @emily.bsky.team see a stranger using bluesky on public transit before 2024?"
+
   Post: "${post_text}"
   Author: ${author_handle}
   Response:`;
@@ -91,6 +137,8 @@ async function createPredictionMarket(post: any, resolver: string) {
   // Create the JSON from the question
   const jsonPrompt = `Create a manifold.markets prediction market JSON from a question. Do not use trailing commas. Begin your output with
     [BEGIN OUTPUT] and end it with [END OUTPUT]. Use the YYYY-DD-DDTHH:MM:SS.000Z timestamp format for the closeTime (use UTC).
+    As useful context when setting the market resolution dates, the current date/time is ${date} (in UTC).
+    You should only ever create BINARY markets.
 
     Example:
     Post: "I caught the very tail end of the hedge fund boom when it was clear that employee compensation on Wall Street was going to be structurally lower going forward than it was before the mid-2000's, and it's the same exact dynamic in Silicon Valley today."
@@ -113,27 +161,30 @@ async function createPredictionMarket(post: any, resolver: string) {
   // Strip begin and end output
   json = json.replace('[BEGIN OUTPUT]', '').replace('[END OUTPUT]', '');
 
-  console.log('json', json)
+  console.log('raw json: ', json)
 
   // parse the json
   const marketJSON = JSON.parse(json);
 
   // Convert the closeTime string to a Date object and
-  // store it as a unix timestamp
-  marketJSON.closeTime = new Date(marketJSON.closeTime).getTime() / 1000;
+  // store it as a unix timestamp in ms 
+  marketJSON.closeTime = new Date(marketJSON.closeTime).getTime();
 
   // Add the resolver
   marketJSON.descriptionMarkdown += "\n\nResolver: @" + resolver;
+  // Get the post ID from the last fragment ("/" seperated) of the uri
+  const postID = post.uri.split('/').pop();
   // Add the market link to the description
-  marketJSON.descriptionMarkdown += "\n\nMarket created for [this post](https://bsky.app/profile/" + post.author.handle + "/post/" + post.record.id + ")";
+  marketJSON.descriptionMarkdown += "\n\nMarket created for [this post](https://staging.bsky.app/profile/" + post.author.handle + "/post/" + postID + ")";
 
-  const market = await manifold.createMarket(marketJSON);
+  // log the market json
+  console.log('marketJSON: ', marketJSON)
 
-  return market;
+  return await manifold.createMarket(marketJSON);
 }
 
-async function replyWithMarketLink(post: any, notif: AppBskyNotificationListNotifications.Notification, resolver: string) {
-  const createMarketResp = await createPredictionMarket(post, resolver);
+async function replyWithMarketLink(originalPost: Post, notif: AppBskyNotificationListNotifications.Notification, resolver: string) {
+  const createMarketResp = await createPredictionMarket(originalPost, resolver);
 
   // wait 5 seconds
   await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -167,32 +218,78 @@ async function replyWithMarketLink(post: any, notif: AppBskyNotificationListNoti
 }
 
 function getResolverFromText(text: string): string | null {
-  const resolverMatch = text?.match(/resolver:\s*@([\w.-]+)/i);
+  // Extract the resolver from the text, which may have multiple lines (e.g. Resolver: @vivalapanda.moe)
+  const resolverMatch = text.match(/Resolver: @([a-zA-Z0-9._-]+)/);
   return resolverMatch ? resolverMatch[1] : null;
 }
 
-async function handleMention(mention, notif: AppBskyNotificationListNotifications.Notification) {
-  console.log('mention', mention);
+// extract the post from the mention/notif
+async function extractReplyPost(mention: Reply): Promise<Post | undefined> {
   const postThread = await agent.getPostThread({
     uri: mention.parent.uri,
   });
 
   if (postThread.success) {
-    const mentionRecord = notif.record as any
-    const resolver = getResolverFromText(mentionRecord.text) || notif.author.handle;
-    await replyWithMarketLink(postThread.data?.thread?.post, notif, resolver);
+    return postThread.data?.thread?.post as Post;
   }
+
+  return undefined;
 }
 
-async function handleMarketResolution(reply: { text: string; }, notif: AppBskyNotificationListNotifications.Notification) {
-  const resolutionMatch = reply.text.match(/Resolve:\s*(Yes|No|n\/a)/i);
-  if (resolutionMatch) {
-    const resolution = resolutionMatch[1].toLowerCase();
-    console.log(`Market resolution: ${resolution}`);
-    // Call the Manifold API to resolve the market here
-  } else {
-    console.log('Invalid resolution format');
+async function handleMention(notifParent: Post, notif: AppBskyNotificationListNotifications.Notification) {
+  const mentionRecord = notif.record as Record
+  const resolver = getResolverFromText(mentionRecord.text) || notif.author.handle;
+
+  await replyWithMarketLink(notifParent, notif, resolver);
+}
+
+// Get market data from a post
+async function extractMarketFromText(text: string): Promise<FullMarket | undefined> {
+  // Get the link to the market from the post (Just match the only link in the post)
+  // e.g Will @vivalapanda.moe's bot be fixed by end of April 28th, 2023?: Bet on it at https://manifold.markets/bskybot/will-vivalapandamoes-bot-be-fixed-b
+  const marketLinkMatch = text.match(/https:\/\/manifold.markets\/bskybot\/([a-zA-Z0-9_-]+)/);
+  if (!marketLinkMatch) {
+    console.log('Could not find market link in post');
+    return undefined;
   }
+
+  // Get the market id from the link
+  const marketSlug = marketLinkMatch[1];
+
+  // Get the contents of the market so we can check to make sure the resolver matches
+  return await manifold.getMarket({
+    slug: marketSlug,
+  });
+}
+
+async function handleMarketResolution(notifParent: Post, notif: AppBskyNotificationListNotifications.Notification, resolution: "YES" | "NO" | "CANCEL") {
+  console.log(`Market resolution: ${resolution}`);
+
+  const market = await extractMarketFromText(notifParent.record.text);
+  console.log("Market: ", market);
+
+  if (!market) {
+    console.log('Could not find market');
+    return;
+  }
+
+  // Extract the resolver from the market text
+  const resolverMatch = getResolverFromText(market.textDescription);
+
+  // Check that the resolver matches the resolver in the market
+  console.log(`Resolver: ${resolverMatch}`);
+  console.log(`Notif author: ${notif.author.handle}`);
+  if (!resolverMatch || (resolverMatch.toLowerCase() !== notif.author.handle.toLowerCase())) {
+    console.log('Resolver does not match');
+    return;
+  }
+
+  // Resolve the market
+  manifold.resolveMarket({
+    marketId: market.id,
+    outcome: resolution,
+  });
+  console.log('Resolved market');
 }
 
 async function listenForMentions() {
@@ -200,7 +297,7 @@ async function listenForMentions() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     // listen for mentions using listNotifications
-    let response_notifs
+    let response_notifs: AppBskyNotificationListNotifications.Response
     try {
       response_notifs = await agent.listNotifications()
     } catch (e) {
@@ -221,40 +318,62 @@ async function listenForMentions() {
         notif.isRead === false
       )
     })
-    if (notifs.length > 0) {
-      // console.log('notifs', notifs)
-    }
     if (unread_mentions.length > 0) {
       console.log(`Found ${unread_mentions.length} new mentions.`)
     }
+    
+    await agent.updateSeenNotifications()
 
-    unread_mentions.map(async notif => {
-      console.log(`Responding to ${notif.uri}`)
-      console.log('notif', notif)
+    await Promise.all(
+      unread_mentions.map(async notif => {
+        const notifRecord = notif.record as Record
+        console.log('notifRecord', notifRecord)
+        
+        // if record.reply has no parent, skip it
+        if (!notifRecord?.reply?.parent) {
+          console.log('skipping because has no parent')
+          return
+        }
 
-      const record = notif.record as any
-      
-      // if record.reply has no parent, skip it
-      if (!record?.reply?.parent) {
-        console.log('skipping')
-        return
-      }
+        // if record.text doesn't include our handle, skip it
+        const ourHandle = process.env.BSKY_USERNAME
+        // TODO: centralize checking and storing of the env variables
+        if (ourHandle && !notifRecord.text.includes(ourHandle)) {
+          console.log('skipping because does not include our handle')
+          return
+        }
+        
+        try {
+          const notifParent = await extractReplyPost(notifRecord.reply);
+          console.log('notifParent', notifParent)
 
-      // if record.text doesn't include our handle, skip it
-      if (!record.text.includes(process.env.BSKY_USERNAME)) {
-        console.log('skipping')
-        return
-      }
-      
-      if (notif.reason === 'reply' && record.reply.parent.author.handle === process.env.BSKY_USERNAME) {
-        await handleMarketResolution(record.reply, notif);
-      } else {
-        await handleMention(record.reply, notif);
-      }
-    })
+          if (notifParent) {
+            // Check if the notifParent.record.text contains "Resolve: YES" anywhere in the string
+            const resolutionMatch = notifRecord.text.match(/Resolve:\s*(YES|NO|CANCEL)/i);
+            if (resolutionMatch) {
+              // this is a reply to one of our posts, check if it contains a resolution
+              console.log('handling market resolution')
+              const resolution = resolutionMatch[1];
 
-    // Only update notifs after we've successfully handled them
-    agent.updateSeenNotifications()
+              // Type resolution as one of "YES" | "NO" | "MKT" | "CANCEL"
+              const typedResolution = resolution as "YES" | "NO" | "CANCEL";
+
+              await handleMarketResolution(notifParent, notif, typedResolution);
+            } else {
+              console.log('handling market creation')
+              await handleMention(notifParent, notif);
+            }
+          }
+
+          console.log('not a reply, skipping')
+          return
+        } catch (e: any) {
+            // Print the error and the short stacktrace but not the full response
+            console.log('error', e.message);
+            console.log('stack', e.stack);
+        }
+      })
+    );
 
     // Wait 30 seconds before checking again
     await new Promise((resolve) => setTimeout(resolve, 30000));
