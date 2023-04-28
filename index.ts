@@ -1,6 +1,7 @@
 import bsky, { AppBskyNotificationListNotifications } from '@atproto/api';
 const { BskyAgent } = bsky;
 const { RichText } = bsky;
+import { backOff } from "exponential-backoff";
 import * as dotenv from 'dotenv';
 import process from 'node:process';
 dotenv.config();
@@ -45,9 +46,10 @@ async function callGPT4(prompt: string) {
   }
 }
 
-async function createPredictionMarket(post) {
+async function createPredictionMarket(post: any, resolver: string) {
   const post_text = post.record.text
   const date = post.record.createdAt
+
   const author_handle = post.author.handle
 
   // Convert the post into a question phrased like a prediction market
@@ -55,6 +57,7 @@ async function createPredictionMarket(post) {
   including resolution criteria, timeline.
   As useful context when setting the market resolution dates, the current date/time is ${date} (in UTC).
   If you reference a user in the market title, preface their handle with an @ symbol.
+  The response should be at most 120 characters.
 
   Example:
   Post: "I caught the very tail end of the hedge fund boom when it was clear that employee compensation on Wall Street was going to be structurally lower going forward than it was before the mid-2000's, and it's the same exact dynamic in Silicon Valley today."
@@ -80,19 +83,25 @@ async function createPredictionMarket(post) {
   Response:`;
   const question = await callGPT4(prompt);
 
+  // Check if the question is too long
+  if (question.length > 120) {
+    throw new Error("Question is too long");
+  }
+
   // Create the JSON from the question
   const jsonPrompt = `Create a manifold.markets prediction market JSON from a question. Do not use trailing commas. Begin your output with
     [BEGIN OUTPUT] and end it with [END OUTPUT]. Use the YYYY-DD-DDTHH:MM:SS.000Z timestamp format for the closeTime (use UTC).
 
     Example:
-    Input: "Will real 75th percentile software engineer comp be higher than today in 2025 in The Bay Area"
+    Post: "I caught the very tail end of the hedge fund boom when it was clear that employee compensation on Wall Street was going to be structurally lower going forward than it was before the mid-2000's, and it's the same exact dynamic in Silicon Valley today."
+    Question: "Will real 75th percentile software engineer comp be higher than today in 2025 in The Bay Area"
     [BEGIN OUTPUT]
     {
-      "description": "Prediction market for the post https://bsky.app/profile/mfoldbot.bsky.social/post/3jtvtu5yvds2v",
       "outcomeType": "BINARY",
       "question": "Will real 75th percentile software engineer comp be higher than today in 2025 in The Bay Area",
       "closeTime": "2025-01-01T00:00:00.000Z",
-      "initialProb": 50
+      "initialProb": 50,
+      "descriptionMarkdown": "Resolution fully based on the individual judgement of the following resolver."
     }
     [END OUTPUT]
 
@@ -109,36 +118,22 @@ async function createPredictionMarket(post) {
   // parse the json
   const marketJSON = JSON.parse(json);
 
-  // Replace the 2025-01-01T00:00:00.000Z timestamp with a unix timestamp
-  marketJSON.closeTime = new Date(Date.UTC(
-    marketJSON.closeTime.getFullYear(),
-    marketJSON.closeTime.getMonth(),
-    marketJSON.closeTime.getDate(),
-    marketJSON.closeTime.getHours(),
-    marketJSON.closeTime.getMinutes(),
-    marketJSON.closeTime.getSeconds()
-  )).getTime();
+  // Convert the closeTime string to a Date object and
+  // store it as a unix timestamp
+  marketJSON.closeTime = new Date(marketJSON.closeTime).getTime() / 1000;
+
+  // Add the resolver
+  marketJSON.descriptionMarkdown += "\n\nResolver: @" + resolver;
+  // Add the market link to the description
+  marketJSON.descriptionMarkdown += "\n\nMarket created for [this post](https://bsky.app/profile/" + post.author.handle + "/post/" + post.record.id + ")";
 
   const market = await manifold.createMarket(marketJSON);
 
   return market;
 }
 
-// development function to test manifold market creation
-async function testManifold() {
-  const market = await manifold.createMarket({
-    descriptionMarkdown: "Prediction market for [the post](https://bsky.app/profile/mfoldbot.bsky.social/post/3jtvtu5yvds2v)",
-    outcomeType: "BINARY",
-    question: "Will real 75th percentile software engineer comp be higher than today in 2025 in The Bay Area",
-    closeTime: 1767225600000,
-    initialProb: 50
-  });
-
-  console.log('market', market)
-}
-
-async function replyWithMarketLink(post, notif) {
-  const createMarketResp = await createPredictionMarket(post);
+async function replyWithMarketLink(post: any, notif: AppBskyNotificationListNotifications.Notification, resolver: string) {
+  const createMarketResp = await createPredictionMarket(post, resolver);
 
   // wait 5 seconds
   await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -171,13 +166,32 @@ async function replyWithMarketLink(post, notif) {
   console.log('posted reply: ', rt.text, rt.facets)
 }
 
-async function handleMention(mention, notif: AppBskyNotificationListNotifications.Notification) { 
-  console.log('mention', mention)
-  const postThread = await agent.getPostThread({ 
+function getResolverFromText(text: string): string | null {
+  const resolverMatch = text?.match(/resolver:\s*@([\w.-]+)/i);
+  return resolverMatch ? resolverMatch[1] : null;
+}
+
+async function handleMention(mention, notif: AppBskyNotificationListNotifications.Notification) {
+  console.log('mention', mention);
+  const postThread = await agent.getPostThread({
     uri: mention.parent.uri,
   });
+
   if (postThread.success) {
-    await replyWithMarketLink(postThread.data?.thread?.post, notif);
+    const mentionRecord = notif.record as any
+    const resolver = getResolverFromText(mentionRecord.text) || notif.author.handle;
+    await replyWithMarketLink(postThread.data?.thread?.post, notif, resolver);
+  }
+}
+
+async function handleMarketResolution(reply: { text: string; }, notif: AppBskyNotificationListNotifications.Notification) {
+  const resolutionMatch = reply.text.match(/Resolve:\s*(Yes|No|n\/a)/i);
+  if (resolutionMatch) {
+    const resolution = resolutionMatch[1].toLowerCase();
+    console.log(`Market resolution: ${resolution}`);
+    // Call the Manifold API to resolve the market here
+  } else {
+    console.log('Invalid resolution format');
   }
 }
 
@@ -186,7 +200,15 @@ async function listenForMentions() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     // listen for mentions using listNotifications
-    const response_notifs = await agent.listNotifications()
+    let response_notifs
+    try {
+      response_notifs = await agent.listNotifications()
+    } catch (e) {
+      console.log('error', e)
+      // wait 1 minute before trying again
+      await new Promise((resolve) => setTimeout(resolve, 60000));
+      continue
+    }
     const notifs = response_notifs.data.notifications
 
     // Mark all these notifs as read
@@ -223,8 +245,12 @@ async function listenForMentions() {
         console.log('skipping')
         return
       }
-
-      await handleMention(record.reply, notif)
+      
+      if (notif.reason === 'reply' && record.reply.parent.author.handle === process.env.BSKY_USERNAME) {
+        await handleMarketResolution(record.reply, notif);
+      } else {
+        await handleMention(record.reply, notif);
+      }
     })
 
     // Only update notifs after we've successfully handled them
@@ -247,7 +273,12 @@ async function main() {
   if (!process.env.BSKY_USERNAME || !process.env.BSKY_PASSWORD) {
     throw new Error('BSKY_USERNAME and BSKY_PASSWORD must be set in the environment');
   }
-  await agent.login({ identifier: process.env.BSKY_USERNAME, password: process.env.BSKY_PASSWORD });
+
+  const username = process.env.BSKY_USERNAME;
+  const password = process.env.BSKY_PASSWORD;
+
+  // login to the agent. If it fails, do exponential backoff
+  await backOff(() => agent.login({ identifier: username, password: password }), { maxDelay: 60000, numOfAttempts: 10 });
 
   // await testCallGpt4();
   await listenForMentions();
