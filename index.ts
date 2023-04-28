@@ -184,7 +184,19 @@ async function createPredictionMarket(post: Post, resolver: string) {
 }
 
 async function replyWithMarketLink(originalPost: Post, notif: AppBskyNotificationListNotifications.Notification, resolver: string) {
-  const createMarketResp = await createPredictionMarket(originalPost, resolver);
+  // Try to create the market. If it fails, try once more and then give up
+  let createMarketResp;
+  try {
+    createMarketResp = await createPredictionMarket(originalPost, resolver);
+  } catch (e) {
+    console.log('error creating market: ', e);
+    try {
+      createMarketResp = await createPredictionMarket(originalPost, resolver);
+    } catch (e) {
+      console.log('error creating market: ', e);
+      return;
+    }
+  }
 
   // wait 5 seconds
   await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -331,7 +343,30 @@ async function listenForMentions() {
         
         // if record.reply has no parent, skip it
         if (!notifRecord?.reply?.parent) {
-          console.log('skipping because has no parent')
+          // Post a message explaining usage
+          const usageInfo = `Hi! I can only be invoked in the following ways right now:
+
+          - @ me in the reply to a post to turn that post in a market
+          
+          - Respond to a market I've posted for you with "Resolve: YES/NO/CANCEL" to resolve the market
+          
+          Also, you can ping my mom @vivalapanda.moe if something doesn't appear to be working.`
+
+          await agent.post({
+            text: usageInfo,
+            facets: [],
+            reply: {
+              root: {
+                uri: notif.uri,
+                cid: notif.cid,
+              },
+              parent: {
+                uri: notif.uri,
+                cid: notif.cid,
+              },
+            }
+          });
+
           return
         }
 
