@@ -149,7 +149,7 @@ async function createPredictionMarket(post: Post, resolver: string) {
       "question": "Will real 75th percentile software engineer comp be higher than today in 2025 in The Bay Area",
       "closeTime": "2025-01-01T00:00:00.000Z",
       "initialProb": 50,
-      "descriptionMarkdown": "Resolution fully based on the individual judgement of the following resolver."
+      "descriptionMarkdown": "Resolution fully based on the individual judgement of the following resolver (or @VivaLaPanda on Manifold if they can't resolve)."
     }
     [END OUTPUT]
 
